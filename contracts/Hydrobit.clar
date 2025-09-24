@@ -9,11 +9,15 @@
 (define-constant err-already-registered (err u105))
 (define-constant err-meter-not-found (err u106))
 (define-constant err-unauthorized (err u107))
+(define-constant err-no-analytics-data (err u108))
+(define-constant err-reward-claimed-recently (err u109))
 
 (define-data-var daily-token-rate uint u10)
 (define-data-var base-daily-allowance uint u1000)
 (define-data-var total-users uint u0)
 (define-data-var contract-paused bool false)
+(define-data-var community-total-usage uint u0)
+(define-data-var conservation-reward-pool uint u5000)
 
 (define-map user-profiles
   { user: principal }
@@ -51,6 +55,24 @@
 (define-map authorized-readers
   { reader: principal }
   { authorized: bool }
+)
+
+(define-map conservation-analytics
+  { user: principal }
+  {
+    efficiency-score: uint,
+    conservation-tier: uint,
+    total-savings: uint,
+    last-reward-claim: uint,
+    milestone-bronze: bool,
+    milestone-silver: bool,
+    milestone-gold: bool
+  }
+)
+
+(define-map weekly-usage-history
+  { user: principal, week: uint }
+  { total-usage: uint, avg-daily: uint }
 )
 
 (define-private (get-current-day)
@@ -189,6 +211,9 @@
         (try! (ft-burn? hydrobit-token tokens-needed user))
         true
       )
+      
+      (var-set community-total-usage (+ (var-get community-total-usage) usage-amount))
+      (try! (update-conservation-analytics user))
       
       (ok { usage: usage-amount, tokens-spent: tokens-needed, remaining-allowance: (if (> daily-allowance new-daily-usage) (- daily-allowance new-daily-usage) u0) })
     )
@@ -355,5 +380,171 @@
         )
       none
     )
+  )
+)
+
+(define-private (calculate-efficiency-score (user principal))
+  (let (
+    (profile-opt (get-user-profile user))
+  )
+    (match profile-opt
+      profile
+        (let (
+          (user-total (get total-usage profile))
+          (community-avg (if (> (var-get total-users) u0) (/ (var-get community-total-usage) (var-get total-users)) u0))
+        )
+          (if (and (> community-avg u0) (> user-total u0))
+            (if (<= user-total community-avg)
+              (+ u50 (/ (* (- community-avg user-total) u50) community-avg))
+              (if (> (- user-total community-avg) community-avg) u0 (- u50 (/ (* (- user-total community-avg) u50) community-avg)))
+            )
+            u50
+          )
+        )
+      u50
+    )
+  )
+)
+
+(define-private (determine-conservation-tier (score uint))
+  (if (>= score u90) u4
+    (if (>= score u75) u3
+      (if (>= score u60) u2
+        (if (>= score u50) u1 u0)
+      )
+    )
+  )
+)
+
+(define-public (update-conservation-analytics (user principal))
+  (let (
+    (current-analytics (default-to { efficiency-score: u50, conservation-tier: u0, total-savings: u0, last-reward-claim: u0, milestone-bronze: false, milestone-silver: false, milestone-gold: false } (map-get? conservation-analytics { user: user })))
+    (new-score (calculate-efficiency-score user))
+    (new-tier (determine-conservation-tier new-score))
+    (profile (unwrap! (get-user-profile user) err-not-registered))
+    (community-avg (if (> (var-get total-users) u0) (/ (var-get community-total-usage) (var-get total-users)) u0))
+    (user-usage (get total-usage profile))
+    (savings (if (and (> community-avg u0) (< user-usage community-avg)) (- community-avg user-usage) u0))
+  )
+    (map-set conservation-analytics
+      { user: user }
+      {
+        efficiency-score: new-score,
+        conservation-tier: new-tier,
+        total-savings: (+ (get total-savings current-analytics) savings),
+        last-reward-claim: (get last-reward-claim current-analytics),
+        milestone-bronze: (or (get milestone-bronze current-analytics) (>= (+ (get total-savings current-analytics) savings) u1000)),
+        milestone-silver: (or (get milestone-silver current-analytics) (>= (+ (get total-savings current-analytics) savings) u5000)),
+        milestone-gold: (or (get milestone-gold current-analytics) (and (>= (+ (get total-savings current-analytics) savings) u10000) (>= new-score u80)))
+      }
+    )
+    (ok new-score)
+  )
+)
+
+(define-public (claim-conservation-reward)
+  (let (
+    (analytics (unwrap! (map-get? conservation-analytics { user: tx-sender }) err-no-analytics-data))
+    (current-tier (get conservation-tier analytics))
+    (current-day (get-current-day))
+    (last-claim (get last-reward-claim analytics))
+    (reward-amount (if (> current-tier u0) (* current-tier u25) u0))
+  )
+    (asserts! (> current-tier u0) err-invalid-amount)
+    (asserts! (> current-day (+ last-claim u7)) err-reward-claimed-recently)
+    (asserts! (<= reward-amount (var-get conservation-reward-pool)) err-insufficient-tokens)
+    
+    (map-set conservation-analytics
+      { user: tx-sender }
+      (merge analytics { last-reward-claim: current-day })
+    )
+    
+    (var-set conservation-reward-pool (- (var-get conservation-reward-pool) reward-amount))
+    (try! (ft-mint? hydrobit-token reward-amount tx-sender))
+    
+    (let ((profile (unwrap! (get-user-profile tx-sender) err-not-registered)))
+      (map-set user-profiles
+        { user: tx-sender }
+        (merge profile {
+          token-balance: (+ (get token-balance profile) reward-amount)
+        })
+      )
+    )
+    (ok reward-amount)
+  )
+)
+
+(define-public (predict-weekly-usage (user principal))
+  (let (
+    (current-week (/ (get-current-day) u7))
+    (profile (unwrap! (get-user-profile user) err-not-registered))
+    (current-day (get-current-day))
+    (daily-avg (if (> current-day u0) (/ (get total-usage profile) current-day) u0))
+    (predicted-weekly (* daily-avg u7))
+  )
+    (map-set weekly-usage-history
+      { user: user, week: (+ current-week u1) }
+      { total-usage: predicted-weekly, avg-daily: daily-avg }
+    )
+    (ok predicted-weekly)
+  )
+)
+
+(define-public (add-conservation-rewards (amount uint))
+  (begin
+    (asserts! (is-owner) err-owner-only)
+    (var-set conservation-reward-pool (+ (var-get conservation-reward-pool) amount))
+    (ok (var-get conservation-reward-pool))
+  )
+)
+
+(define-read-only (get-conservation-analytics (user principal))
+  (map-get? conservation-analytics { user: user })
+)
+
+(define-read-only (get-efficiency-score (user principal))
+  (default-to u50 (get efficiency-score (map-get? conservation-analytics { user: user })))
+)
+
+(define-read-only (get-conservation-tier (user principal))
+  (default-to u0 (get conservation-tier (map-get? conservation-analytics { user: user })))
+)
+
+(define-read-only (get-conservation-milestones (user principal))
+  (let ((analytics (map-get? conservation-analytics { user: user })))
+    (match analytics
+      data {
+        bronze: (get milestone-bronze data),
+        silver: (get milestone-silver data),
+        gold: (get milestone-gold data)
+      }
+      { bronze: false, silver: false, gold: false }
+    )
+  )
+)
+
+(define-read-only (get-weekly-prediction (user principal) (week uint))
+  (map-get? weekly-usage-history { user: user, week: week })
+)
+
+(define-read-only (get-community-average)
+  (if (> (var-get total-users) u0) 
+    (/ (var-get community-total-usage) (var-get total-users)) 
+    u0
+  )
+)
+
+(define-read-only (get-conservation-summary (user principal))
+  (let (
+    (analytics (map-get? conservation-analytics { user: user }))
+    (milestones (get-conservation-milestones user))
+    (community-avg (get-community-average))
+  )
+    {
+      analytics: analytics,
+      milestones: milestones,
+      community-average: community-avg,
+      reward-pool-remaining: (var-get conservation-reward-pool)
+    }
   )
 )
