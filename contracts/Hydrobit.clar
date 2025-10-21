@@ -11,6 +11,11 @@
 (define-constant err-unauthorized (err u107))
 (define-constant err-no-analytics-data (err u108))
 (define-constant err-reward-claimed-recently (err u109))
+(define-constant err-dispute-window-expired (err u110))
+(define-constant err-duplicate-dispute (err u111))
+(define-constant err-dispute-not-found (err u112))
+(define-constant err-invalid-reading (err u113))
+(define-constant err-dispute-already-resolved (err u114))
 
 (define-data-var daily-token-rate uint u10)
 (define-data-var base-daily-allowance uint u1000)
@@ -73,6 +78,17 @@
 (define-map weekly-usage-history
   { user: principal, week: uint }
   { total-usage: uint, avg-daily: uint }
+)
+
+(define-map disputes
+  { user: principal, meter-id: (string-ascii 32), day: uint }
+  {
+    reason: (string-utf8 500),
+    submitted-at: uint,
+    status: (string-ascii 20),
+    resolution-note: (optional (string-utf8 500)),
+    resolved-at: (optional uint)
+  }
 )
 
 (define-private (get-current-day)
@@ -498,6 +514,52 @@
   )
 )
 
+(define-public (submit-dispute (meter-id (string-ascii 32)) (day uint) (reason (string-utf8 500)))
+  (let
+    (
+      (caller tx-sender)
+      (current-block stacks-block-height)
+      (reading (map-get? meter-readings { meter-id: meter-id, day: day }))
+      (existing-dispute (map-get? disputes { user: caller, meter-id: meter-id, day: day }))
+    )
+    (asserts! (is-some reading) err-invalid-reading)
+    (asserts! (is-none existing-dispute) err-duplicate-dispute)
+    (asserts! (<= (- current-block day) u1008) err-dispute-window-expired)
+    (map-set disputes
+      { user: caller, meter-id: meter-id, day: day }
+      {
+        reason: reason,
+        submitted-at: current-block,
+        status: "pending",
+        resolution-note: none,
+        resolved-at: none
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (resolve-dispute (user principal) (meter-id (string-ascii 32)) (day uint) (approve bool) (resolution-note (string-utf8 500)))
+  (let
+    (
+      (dispute (map-get? disputes { user: user, meter-id: meter-id, day: day }))
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-owner) err-owner-only)
+    (asserts! (is-some dispute) err-dispute-not-found)
+    (asserts! (is-eq (get status (unwrap! dispute err-dispute-not-found)) "pending") err-dispute-already-resolved)
+    (map-set disputes
+      { user: user, meter-id: meter-id, day: day }
+      (merge (unwrap! dispute err-dispute-not-found) {
+        status: (if approve "approved" "rejected"),
+        resolution-note: (some resolution-note),
+        resolved-at: (some current-block)
+      })
+    )
+    (ok true)
+  )
+)
+
 (define-read-only (get-conservation-analytics (user principal))
   (map-get? conservation-analytics { user: user })
 )
@@ -546,5 +608,16 @@
       community-average: community-avg,
       reward-pool-remaining: (var-get conservation-reward-pool)
     }
+  )
+)
+
+(define-read-only (get-dispute (user principal) (meter-id (string-ascii 32)) (day uint))
+  (map-get? disputes { user: user, meter-id: meter-id, day: day })
+)
+
+(define-read-only (get-dispute-status (user principal) (meter-id (string-ascii 32)) (day uint))
+  (match (map-get? disputes { user: user, meter-id: meter-id, day: day })
+    dispute-data (some (get status dispute-data))
+    none
   )
 )
